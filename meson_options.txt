@@ -1,0 +1,7 @@
+option(
+    'build_tests',
+    type: 'combo',
+    choices: ['yes', 'no', 'not_subproject'],
+    value: 'not_subproject',
+    description: 'Controls whether test targets should be built'
+)

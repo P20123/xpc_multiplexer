@@ -1,0 +1,3 @@
+[submodule "tinyxpc"]
+	path = subprojects/tinyxpc
+	url = https://github.com/PyroAVR/tinyxpc
