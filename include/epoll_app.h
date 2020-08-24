@@ -78,6 +78,14 @@ int epoll_app_del_fd(epoll_app_t *app, int fd);
 int epoll_app_mod_fd(epoll_app_t *app, int fd, int flags);
 
 /**
+ * Retrieve the struct epoll_event associated with the given fd.
+ * @param app the epoll_app to use
+ * @param fd the file descriptor of interest
+ * @return pointer to struct epoll_event, or NULL on failure.
+ */
+struct epoll_event *epoll_app_get_fd_events(epoll_app_t *app, int fd);
+
+/**
  * Close all file descriptors associated with this application context.
  * @param app previously initialized epoll_app_t
  */

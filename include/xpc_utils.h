@@ -34,7 +34,7 @@ typedef struct {
 } xpc_in_ctx_t;
 
 /**
- * Information  describing the state of output to a file descriptor.
+ * Information describing the state of output to a file descriptor.
  */
 typedef struct {
     msg_queue_t *msg_queue;
@@ -57,8 +57,8 @@ typedef struct {
     // we should adjust this so that the functions ask the io event manager to
     // notify on read, write, or none events.
     void *io_event_context;
-    int (*io_add_fd_cb)(void *ctx, int fd);
-    int (*io_del_fd_cb)(void *ctx, int fd);
+    int (*io_notify_read)(void *ctx, int fd, bool enable);
+    int (*io_notify_write)(void *ctx, int fd, bool enable);
 } xpc_router_t;
 
 

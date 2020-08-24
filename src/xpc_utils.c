@@ -138,6 +138,7 @@ int xpc_accumulate_msg(xpc_router_t *ctx, int fd) {
             );
         }
         in_ctx->msg_inflight = true;
+        in_ctx->buf_offset = sizeof(txpc_hdr_t);
     }
     // A message is now inflight, so the stored header of this fd is valid.
     // Fetch the switch table entry for this fd.
@@ -147,6 +148,8 @@ int xpc_accumulate_msg(xpc_router_t *ctx, int fd) {
         // couldn't find that route, just drop the message.
         // this implies reading and ignoring the number of bytes in the size
         // header.
+        char tmp_buf[255];
+        while(read(fd, tmp_buf, 255) > 0);
         goto done;
     }
 
@@ -156,7 +159,6 @@ int xpc_accumulate_msg(xpc_router_t *ctx, int fd) {
         // no queue for this fd. here we make the assumption that any fd
         // in the routing table is already open, so a lack of an fd must be
         // an error in the caller.
-        goto done;
     }
     // NOTE: possible efficiency improvement: store the buffers in a minheap,
     // and now that the message size is known (spec chg.), get one that is
@@ -166,10 +168,8 @@ int xpc_accumulate_msg(xpc_router_t *ctx, int fd) {
     if(msg_buf == NULL) {
         goto done;
     }
-    in_ctx->msg_inflight = true;
     in_ctx->buf_id = msg_buf->buf_id;
     memcpy(msg_buf->buf->buf, &in_ctx->msg_hdr, sizeof(txpc_hdr_t));
-    /*in_ctx->buf_offset += sizeof(txpc_hdr_t);*/
 
     
     // this makes sure there is space to read into, and also limits the size
@@ -193,7 +193,7 @@ int xpc_accumulate_msg(xpc_router_t *ctx, int fd) {
     else {
         // bytes_read was filled by grabbing the header if this is the first
         // call for this message.
-        in_ctx->buf_offset += rd_bytes + bytes_read;
+        in_ctx->buf_offset += rd_bytes;
         // update the size of the actual contents of this message.
         msg_buf->size = in_ctx->buf_offset;
         bytes_read = in_ctx->buf_offset;
@@ -219,10 +219,10 @@ int xpc_accumulate_msg(xpc_router_t *ctx, int fd) {
     }
     else {
         // tell the io event manager to watch the output fd again.
-        if(ctx->io_add_fd_cb != NULL) {
-            ctx->io_add_fd_cb(ctx->io_event_context, sw_ent->fd);
+        if(ctx->io_notify_write != NULL) {
+            ctx->io_notify_write(ctx->io_event_context, sw_ent->fd, true);
         }
-        if(msg_buf->size == sizeof(txpc_hdr_t) + in_ctx->msg_hdr.size) {
+        if(msg_buf->size >= sizeof(txpc_hdr_t) + in_ctx->msg_hdr.size) {
             xpc_msg_finalize(out_ctx->msg_queue, in_ctx->buf_id);
             in_ctx->msg_inflight = false;
         }
@@ -256,18 +256,20 @@ int xpc_write_msg(xpc_router_t *ctx, int fd) {
     }
 
     if(msg_buf != NULL) {
-        bytes_written = write(fd, msg_buf->buf->buf + msg_buf->wr_offset, msg_buf->size);
+        bytes_written = write(fd, (char*)msg_buf->buf->buf + msg_buf->wr_offset, msg_buf->size);
         msg_buf->size -= bytes_written;
         msg_buf->wr_offset += bytes_written;
         // no data to write, we can clear
+        // XXX bug here - can't clear message unless the buffer is actually
+        // empty..?
         xpc_msg_clear(out_ctx->msg_queue, msg_buf->buf_id);
         out_ctx->current_buf_id = -1;
     }
     else {
         // no messages are available for this fd
         // tell the io event system to not continue raising write ready events.
-        if(ctx->io_del_fd_cb != NULL) {
-            ctx->io_del_fd_cb(ctx->io_event_context, fd);
+        if(ctx->io_notify_write != NULL) {
+            ctx->io_notify_write(ctx->io_event_context, fd, false);
         }
     }
 done:
@@ -276,6 +278,7 @@ done:
 
 int xpc_set_route(xpc_router_t *ctx, int ifd, int ofd, int ito, int oto) {
     int status = 0;
+    int bytes_written = 0;
     xpc_switch_tbl_entry_t key = {.fd = ifd, .to_chn = ito};
     xpc_switch_tbl_entry_t val = {.fd = ofd, .to_chn = oto};
     // does this union save stack space? no idea!
@@ -283,6 +286,8 @@ int xpc_set_route(xpc_router_t *ctx, int ifd, int ofd, int ito, int oto) {
         xpc_in_ctx_t in_ctx;
         xpc_out_ctx_t out_ctx;
     } ctxts = {0};
+    if(hashmap_fetch(ctx->out_contexts, ofd) == NULL) {
+    }
     // XXX this is because sizeof(xpc_switch_tbl_entry_t) = 8.
     // thus, the dynabuf copies by value, and we need to pass the struct,
     // not a pointer to it.  now THAT is a frustrating little gotcha.
@@ -299,6 +304,26 @@ int xpc_set_route(xpc_router_t *ctx, int ifd, int ofd, int ito, int oto) {
         create_xpc_out_ctx(&ctxts.out_ctx);
         hashmap_set(ctx->out_contexts, ofd, &ctxts.out_ctx);
         status = (hashmap_status(ctx->out_contexts) != ALC_HASHMAP_SUCCESS);
+        // send a connect message
+        // this means all connections are bidirectional, and implies a master/
+        // slave relationship to connections.  do we want this?
+        // FIXME change this to enqueueing a message to the sender.
+        txpc_msg_t msg = {0};
+        msg.hdr.size = 0xbe;
+        msg.hdr.type = 0xad;
+        msg.hdr.to = 1;
+        msg.hdr.from = 2;
+        msg_buf_t *msg_buf = xpc_msg_getbuf(ctxts.out_ctx.msg_queue, -1);
+        memcpy(msg_buf->buf->buf, &msg, sizeof(txpc_msg_t));
+        msg_buf->size = sizeof(txpc_msg_t);
+        xpc_msg_finalize(ctxts.out_ctx.msg_queue, msg_buf->buf_id);
+    }
+
+    if(ctx->io_notify_read != NULL) {
+        ctx->io_notify_read(ctx->io_event_context, ifd, true);
+    }
+    if(ctx->io_notify_write != NULL) {
+        ctx->io_notify_write(ctx->io_event_context, ofd, true);
     }
 done:
     return status;
@@ -309,6 +334,10 @@ int xpc_remove_route(xpc_router_t *ctx, int ifd, int ito) {
     xpc_switch_tbl_entry_t key = {.fd = ifd, .to_chn = ito};
     hashmap_remove(ctx->switch_tbl, *(void**)&key);
     hashmap_remove(ctx->in_contexts, *(void**)&key);
-    // what about the output context?
+    // can't handle output context, it may still be in use.
+    // Cleanup of outputs is left for program shutdown or connection termination
+    if(ctx->io_notify_read != NULL) {
+        ctx->io_notify_read(ctx->io_event_context, ifd, false);
+    }
     return hashmap_status(ctx->switch_tbl) != ALC_HASHMAP_SUCCESS;
 }
