@@ -129,25 +129,17 @@ done:
 }
 
 int epoll_app_mod_fd(epoll_app_t *app, int fd, int flags) {
-    int fd_index = array_size(app->event_list);
-    struct epoll_event epoll_temp = {0};
-    epoll_temp.events = flags;
-    // NOTE: this can be used to store any pointer and will be available
-    // from epoll_wait when it unblocks
-    epoll_temp.data = (epoll_data_t)fd;
-
-    // alc will copy the local structure
-    array_append(app->event_list, &epoll_temp);
-    // ensure there is space for epoll to have all fds active after epoll_wait()
-    array_resize(app->event_buffer, array_size(app->event_list));
-
-    // add event_list to epoll
+    int status = 0;
+    struct epoll_event *epoll_temp = epoll_app_get_fd_events(app, fd);
+    if(epoll_temp == NULL) {
+        // couldn't find that fd, caller likely meant to call add
+        status = epoll_app_add_fd(app, fd, flags);
+        goto done;
+    }
+    // ask epoll to modify the events monitored for this fd
     int r = epoll_ctl(
         app->epoll_fd, EPOLL_CTL_MOD, fd,
-        // get the permanent address back from the array
-        (struct epoll_event*)array_fetch(
-            app->event_list, fd_index
-        )
+        epoll_temp
     );
     if(r == 0) goto done;
     switch(errno) {
@@ -163,12 +155,24 @@ int epoll_app_mod_fd(epoll_app_t *app, int fd, int flags) {
             // no more watches available for this user
         case EPERM:
             // fd does not refer to an epoll instance, app context is broken.
-            fd_index = -1;
+            status = -1;
         break;
 
     }
 done:
-    return fd_index == -1 ? -1:0;
+    return status;
+}
+struct epoll_event *epoll_app_get_fd_events(epoll_app_t *app, int fd) {
+    struct epoll_event *r = NULL;
+    iter_context *it = create_array_iterator(app->event_list);
+    for(struct epoll_event *e = iter_next(it); e; e = iter_next(it)) {
+        if(e->data.fd == fd) {
+            r = e;
+            break;
+        }
+    }
+done:
+    return r;
 }
 
 void epoll_app_close_all(epoll_app_t *app) {
