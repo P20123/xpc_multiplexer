@@ -93,7 +93,8 @@ if ext_cmocka.found() and should_build_tests
         'test_msg_queue',
         [
             'tests/test_msg_queue.c',
-            'src/xpc_msg_queue.c'
+            'src/xpc_msg_queue.c',
+            'src/xpc_relay.c'
         ],
         include_directories: includes,
         link_with:

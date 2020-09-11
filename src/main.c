@@ -60,24 +60,6 @@ static int app_set_wr_notify(void *ctx, int fd, bool enable) {
 }
 
 
-/*
- *static int app_add_fd(void *ctx, int fd) {
- *    int fd_status = fcntl(fd, F_GETFD);
- *    if(fd_status & O_RDONLY) {
- *        epoll_app_add_fd(ctx, fd, epoll_rd_flags);
- *    }
- *    else if(fd_status & O_WRONLY) {
- *        epoll_app_add_fd(ctx, fd, epoll_wr_flags);
- *    }
- *    else {
- *        epoll_app_add_fd(ctx, fd, epoll_rdwr_flags);
- *    }
- *}
- *
- *static int app_del_fd(void *ctx, int fd) {
- *    epoll_app_del_fd(ctx, fd);
- *}
- */
 
 static void unix_signal_handler(int signum) {
     switch(signum) {
