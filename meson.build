@@ -69,7 +69,8 @@ exe_main = executable(
         'src/main.c',
         'src/epoll_app.c',
         'src/xpc_msg_queue.c',
-        'src/xpc_utils.c'
+        'src/xpc_utils.c',
+        'src/xpc_relay.c'
     ],
     include_directories: includes,
     dependencies: [
@@ -93,8 +94,31 @@ if ext_cmocka.found() and should_build_tests
         'test_msg_queue',
         [
             'tests/test_msg_queue.c',
-            'src/xpc_msg_queue.c',
-            'src/xpc_relay.c'
+            'src/xpc_msg_queue.c'
+        ],
+        include_directories: includes,
+        link_with:
+            [
+            ],
+        dependencies: [
+            ext_cmocka,
+            dep_txpc,
+            dep_alc_hashmap,
+            dep_alc_hashmap_iter,
+            dep_alc_hash_functions,
+            dep_alc_comparators,
+            dep_alc_array,
+            dep_alc_iterator,
+            dep_alc_array_iter,
+        ]
+    )
+
+    exe_relay_test = executable(
+        'test_relay',
+        [
+            'tests/test_relay.c',
+            'src/xpc_relay.c',
+            'src/epoll_app.c'
         ],
         include_directories: includes,
         link_with:
@@ -115,5 +139,6 @@ if ext_cmocka.found() and should_build_tests
 
     # test run targets
     test('test_msg_queue', exe_msg_queue_test)
+    test('test_relay', exe_relay_test)
 endif
 # ========= END UNIT TEST BUILD TARGETS =========
