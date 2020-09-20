@@ -113,20 +113,30 @@ int main(void) {
     ctx2.write_fd = fd_set2[1];
     ctx1.read_fd = fd_set2[0];
 
+    // send reset
     xpc_relay_send_reset(&uut1);
+    printf("UUT1\n");
     xpc_wr_op_continue(&uut1);
 
 
+    // receive reset and reply
+    printf("UUT2\n");
     xpc_rd_op_continue(&uut2);
     xpc_wr_op_continue(&uut2);
 
+    // receive reply
+    printf("UUT1\n");
     xpc_rd_op_continue(&uut1);
+    printf("--->reset test complete\n");
 
     // reset sequence complete, send a message!
     xpc_send_msg(&uut1, 1, 1, "hello uut2!\n", 12);
     xpc_wr_op_continue(&uut1);
+    xpc_rd_op_continue(&uut2);
+
     xpc_send_msg(&uut2, 1, 1, "hello uut1!\n", 12);
     xpc_wr_op_continue(&uut2);
+    xpc_rd_op_continue(&uut1);
 
     close(fd_set1[0]);
     close(fd_set1[1]);
