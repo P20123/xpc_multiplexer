@@ -78,126 +78,92 @@ done:
     return status;
 }
 
+// changes:
+//  - no link with flow control, this is problematic 
+
 xpc_status_t xpc_wr_op_continue(xpc_relay_state_t *self) {
     int status = TXPC_STATUS_DONE;
-    if(self == NULL || self->write == NULL) {
+    if(self == NULL || self->read == NULL) {
         status = TXPC_STATUS_BAD_STATE;
         goto done;
     }
 
-    if(self->inflight_wr_op.op == TXPC_OP_NONE) {
-        self->inflight_wr_op.bytes_complete = 0;
-        // goto send reset state if we received a reset or if we are sending
-        // a reset message.
-        if(self->signals & SIG_RST_RECVD || self->signals & SIG_RST_SEND) {
-            self->inflight_wr_op.op = TXPC_OP_RESET;
-            self->inflight_wr_op.bytes_complete = 0;
-            self->inflight_wr_op.msg_hdr = (txpc_hdr_t){
-                .size = 0, .type = 1, .to = 0, .from = 0
-            };
-            self->inflight_wr_op.buf = NULL;
-            self->inflight_wr_op.total_bytes = sizeof(txpc_hdr_t);
-            printf("starting reset write sequence\n");
-        }
-        else if(self->signals & SIG_DISC_RECVD) {
-            // some de-init should probably go here.
-            goto done;
-        }
-        else {
-            // none of the other signals require action on the
-            // write state machine, exit successfully here.
-            goto done;
-        }
-    }
-
-    // actually perform write operations here
+    int starting_state = -1;
+    bool do_payload_write = false;
+    bool prev_payload_write = false;
     int bytes = 0;
-    // write the message header first, if it has not been sent yet.
-    if(self->inflight_wr_op.bytes_complete < sizeof(txpc_hdr_t)) {
-        printf("doing header write\n");
-        char *buf = (char*)&self->inflight_wr_op.msg_hdr;
-        bytes = self->write(self->io_ctx, &buf, sizeof(txpc_hdr_t));
-        self->inflight_wr_op.bytes_complete += bytes;
-    }
-    if(self->inflight_wr_op.bytes_complete < self->inflight_wr_op.total_bytes &&
-            self->inflight_wr_op.bytes_complete >= sizeof(txpc_hdr_t)) {
-        printf("doing payload write\n");
-        bytes = self->write(
-            self->io_ctx, &self->inflight_wr_op.buf, self->inflight_wr_op.total_bytes - self->inflight_wr_op.bytes_complete
-        );
-        self->inflight_wr_op.bytes_complete += bytes;
-    }
-    printf("bytes written: %i\n", bytes);
-    // check rd and wr signals only in none state
-    // do msg wr if pending/inflight
-    // revert to none if msg wr complete
-    // always return to idle after compl
-    // determine state transitions, if any.
-    switch(self->inflight_wr_op.op) {
-        case TXPC_OP_NONE:
-            // this state is escaped when a signal comes in from the read
-            // state machine, or when a message send function is called.
-            // ensure byte counter is reset before any new operations start.
-        break;
+    do {
+        bytes = 0;
+        starting_state = self->inflight_wr_op.op;
 
-        case TXPC_OP_RESET:
-            if(self->inflight_wr_op.bytes_complete >= sizeof(txpc_hdr_t)) {
-                if(self->signals & SIG_RST_RECVD) {
-                    printf("finished reset reply\n");
-                    // deassert reset received signal, allow rx state to
-                    // return to normal.
-                    self->signals &= ~SIG_RST_RECVD;
-                    self->io_reset(self->io_ctx, 0, -1);
-                    self->io_reset(self->io_ctx, 1, -1);
+        switch(self->inflight_wr_op.op) {
+            case TXPC_OP_NONE:
+                // check wr signals here
+                if(self->signals & SIG_RST_SEND || self->signals & SIG_RST_RECVD) {
+                    self->inflight_wr_op.op = TXPC_OP_RESET;
+                    self->inflight_wr_op.bytes_complete = 0;
+                    self->inflight_wr_op.total_bytes = sizeof(txpc_hdr_t);
+                    self->inflight_wr_op.msg_hdr = (txpc_hdr_t){
+                        .type = 1, .size = 0, .to = 0, .from = 0
+                    };
                 }
-                // reset io context
-                self->inflight_wr_op.op = TXPC_OP_NONE;
-                self->signals &= ~SIG_RST_SEND;
-                self->inflight_wr_op.bytes_complete = 0;
-                self->inflight_wr_op.total_bytes = 0;
-            }
-        break;
+                // ... other cases here
 
-        case TXPC_OP_MSG:
-            printf("in msg wr state\n");
-            if(self->inflight_wr_op.bytes_complete
-                    == self->inflight_wr_op.msg_hdr.size + sizeof(txpc_hdr_t)) {
-                printf("msg wr done\n");
-                // if the currently inflight message has finished
-                self->io_reset(self->io_ctx, 0, -1);
-                // set state to none
-                self->inflight_wr_op.op = TXPC_OP_NONE;
-                goto done;
-             }
+            break;
 
-        break;
+            case TXPC_OP_RESET:
+                if(self->inflight_wr_op.bytes_complete == sizeof(txpc_hdr_t)) {
+                    if(self->signals & SIG_RST_RECVD) {
+                        // if we did not initiate, we just sent the reply
+                        self->signals &= ~SIG_RST_RECVD;
+                        self->inflight_wr_op.op = TXPC_OP_NONE;
+                        self->inflight_wr_op.bytes_complete = 0;
+                        self->inflight_wr_op.total_bytes = 0;
+                        self->io_reset(self->io_ctx, 0, -1);
+                        self->io_reset(self->io_ctx, 1, -1);
+                    }
+                    else if(!(self->signals & SIG_RST_SEND)){
+                        // we did initiate, rx sm will de-assert send signal
+                        // and perform io reset
+                        self->inflight_wr_op.op = TXPC_OP_NONE;
+                        self->inflight_wr_op.bytes_complete = 0;
+                        self->inflight_wr_op.total_bytes = 0;
+                    }
+                    // otherwise, we are waiting for the reply.
+                }
+            break;
 
-        case TXPC_OP_STOP:
-            // send disconnect message
-            // set state to none
-        break;
+            case TXPC_OP_MSG:
+                prev_payload_write = do_payload_write;
+                do_payload_write = true;
+                if(self->inflight_wr_op.bytes_complete
+                        == self->inflight_wr_op.msg_hdr.size + sizeof(txpc_hdr_t)) {
+                    // if the currently inflight message has finished
+                    self->io_reset(self->io_ctx, 0, -1);
+                    // set state to none
+                    self->inflight_wr_op.op = TXPC_OP_NONE;
+                    prev_payload_write = do_payload_write;
+                    do_payload_write = false;
+                    goto done;
+                }
+            break;
+        }
 
-        case TXPC_OP_SET_CRC:
-            // send crc bits message
-            // wait for SIG_CRC_RECVD assertion
-            if(self->signals & SIG_CRC_RECVD) {
-                // set state to none
-                self->inflight_wr_op.op = TXPC_OP_NONE;
-                self->signals &= ~SIG_CRC_RECVD;
-            }
-        break;
-
-        case TXPC_OP_SET_ENDIANNESS:
-            // send endianness message
-            // wait for SIG_ENDIANNESS_RECVD assertion
-            // set state to none
-        break;
-
-        default:
-            status = TXPC_STATUS_BAD_STATE;
-            goto done;
-        break;
-    }
+        if(self->inflight_wr_op.bytes_complete < sizeof(txpc_hdr_t) && self->inflight_wr_op.total_bytes > 0) {
+            printf("doing header write\n");
+            char *buf = (char*)&self->inflight_wr_op.msg_hdr;
+            bytes = self->write(self->io_ctx, &buf, sizeof(txpc_hdr_t));
+        }
+        else if(do_payload_write) {
+            printf("doing payload write\n");
+            bytes = self->write(
+                self->io_ctx,
+                &self->inflight_wr_op.buf,
+                self->inflight_wr_op.total_bytes - self->inflight_wr_op.bytes_complete
+            );
+        }
+        self->inflight_wr_op.bytes_complete += bytes;
+    } while(self->inflight_wr_op.op != starting_state || prev_payload_write != do_payload_write);
 done:
     return status;
 }
@@ -274,25 +240,36 @@ xpc_status_t xpc_rd_op_continue(xpc_relay_state_t *self) {
             break;
 
             case TXPC_OP_WAIT_RESET:
-                // reset message received
-                // if we initiated, we just received the reply - go back to norm
-                if(self->signals & SIG_RST_SEND) {
-                    self->signals &= ~(SIG_RST_SEND | SIG_RST_RECVD);
-                    self->io_reset(self->io_ctx, 0, -1);
-                    self->io_reset(self->io_ctx, 1, -1);
-                }
-                else {
-                    // we did not initiate, stay here until SIG_RST_RECVD
-                    // is de-asserted by tx sm
-                    if(self->signals & SIG_RST_RECVD) {
-                        self->inflight_rd_op.op = TXPC_OP_WAIT_RESET;
+                if(self->inflight_rd_op.bytes_complete >= sizeof(txpc_hdr_t) &&
+                        self->inflight_rd_op.msg_hdr.type == 1 &&
+                        self->inflight_rd_op.msg_hdr.to == 0 &&
+                        self->inflight_rd_op.msg_hdr.from == 0 &&
+                        self->inflight_rd_op.msg_hdr.size == 0) {
+                    // reset message received
+                    // if we initiated, we just received the reply - go back to norm
+                    if(self->signals & SIG_RST_SEND) {
+                        self->signals &= ~(SIG_RST_SEND | SIG_RST_RECVD);
+                        self->io_reset(self->io_ctx, 0, -1);
+                        self->io_reset(self->io_ctx, 1, -1);
                     }
                     else {
-                        self->inflight_rd_op.op = TXPC_OP_NONE;
-                        self->inflight_rd_op.bytes_complete = 0;
-                        self->inflight_rd_op.total_bytes = 0;
-                        self->inflight_rd_op.buf = NULL;
+                        // we did not initiate, stay here until SIG_RST_RECVD
+                        // is de-asserted by tx sm
+                        if(self->signals & SIG_RST_RECVD) {
+                            self->inflight_rd_op.op = TXPC_OP_WAIT_RESET;
+                        }
+                        else {
+                            self->inflight_rd_op.op = TXPC_OP_NONE;
+                            self->inflight_rd_op.bytes_complete = 0;
+                            self->inflight_rd_op.total_bytes = 0;
+                            self->inflight_rd_op.buf = NULL;
+                        }
                     }
+                }
+                else {
+                    // incorrect sequence received, reset read ctx, try again.
+                    self->io_reset(self->io_ctx, 1, 5);
+                    self->inflight_rd_op.bytes_complete = 0;
                 }
             break;
 
@@ -471,6 +448,132 @@ done:
  *
  *        case TXPC_OP_WAIT_DISPATCH:
  *
+ *        break;
+ *
+ *        default:
+ *            status = TXPC_STATUS_BAD_STATE;
+ *            goto done;
+ *        break;
+ *    }
+ *done:
+ *    return status;
+ *}
+ */
+ 
+/*
+ *xpc_status_t xpc_wr_op_continue(xpc_relay_state_t *self) {
+ *    int status = TXPC_STATUS_DONE;
+ *    if(self == NULL || self->write == NULL) {
+ *        status = TXPC_STATUS_BAD_STATE;
+ *        goto done;
+ *    }
+ *
+ *    if(self->inflight_wr_op.op == TXPC_OP_NONE) {
+ *        self->inflight_wr_op.bytes_complete = 0;
+ *        // goto send reset state if we received a reset or if we are sending
+ *        // a reset message.
+ *        if(self->signals & SIG_RST_RECVD || self->signals & SIG_RST_SEND) {
+ *            self->inflight_wr_op.op = TXPC_OP_RESET;
+ *            self->inflight_wr_op.bytes_complete = 0;
+ *            self->inflight_wr_op.msg_hdr = (txpc_hdr_t){
+ *                .size = 0, .type = 1, .to = 0, .from = 0
+ *            };
+ *            self->inflight_wr_op.buf = NULL;
+ *            self->inflight_wr_op.total_bytes = sizeof(txpc_hdr_t);
+ *            printf("starting reset write sequence\n");
+ *        }
+ *        else if(self->signals & SIG_DISC_RECVD) {
+ *            // some de-init should probably go here.
+ *            goto done;
+ *        }
+ *        else {
+ *            // none of the other signals require action on the
+ *            // write state machine, exit successfully here.
+ *            goto done;
+ *        }
+ *    }
+ *
+ *    // actually perform write operations here
+ *    int bytes = 0;
+ *    // write the message header first, if it has not been sent yet.
+ *    if(self->inflight_wr_op.bytes_complete < sizeof(txpc_hdr_t)) {
+ *        printf("doing header write\n");
+ *        char *buf = (char*)&self->inflight_wr_op.msg_hdr;
+ *        bytes = self->write(self->io_ctx, &buf, sizeof(txpc_hdr_t));
+ *        self->inflight_wr_op.bytes_complete += bytes;
+ *    }
+ *    if(self->inflight_wr_op.bytes_complete < self->inflight_wr_op.total_bytes &&
+ *            self->inflight_wr_op.bytes_complete >= sizeof(txpc_hdr_t)) {
+ *        printf("doing payload write\n");
+ *        bytes = self->write(
+ *            self->io_ctx, &self->inflight_wr_op.buf, self->inflight_wr_op.total_bytes - self->inflight_wr_op.bytes_complete
+ *        );
+ *        self->inflight_wr_op.bytes_complete += bytes;
+ *    }
+ *    printf("bytes written: %i\n", bytes);
+ *    // check rd and wr signals only in none state
+ *    // do msg wr if pending/inflight
+ *    // revert to none if msg wr complete
+ *    // always return to idle after compl
+ *    // determine state transitions, if any.
+ *    switch(self->inflight_wr_op.op) {
+ *        case TXPC_OP_NONE:
+ *            // this state is escaped when a signal comes in from the read
+ *            // state machine, or when a message send function is called.
+ *            // ensure byte counter is reset before any new operations start.
+ *        break;
+ *
+ *        case TXPC_OP_RESET:
+ *            if(self->inflight_wr_op.bytes_complete >= sizeof(txpc_hdr_t)) {
+ *                if(self->signals & SIG_RST_RECVD) {
+ *                    printf("finished reset reply\n");
+ *                    // deassert reset received signal, allow rx state to
+ *                    // return to normal.
+ *                    self->signals &= ~SIG_RST_RECVD;
+ *                    self->io_reset(self->io_ctx, 0, -1);
+ *                    self->io_reset(self->io_ctx, 1, -1);
+ *                }
+ *                // reset io context
+ *                self->inflight_wr_op.op = TXPC_OP_NONE;
+ *                self->signals &= ~SIG_RST_SEND;
+ *                self->inflight_wr_op.bytes_complete = 0;
+ *                self->inflight_wr_op.total_bytes = 0;
+ *            }
+ *        break;
+ *
+ *        case TXPC_OP_MSG:
+ *            printf("in msg wr state\n");
+ *            if(self->inflight_wr_op.bytes_complete
+ *                    == self->inflight_wr_op.msg_hdr.size + sizeof(txpc_hdr_t)) {
+ *                printf("msg wr done\n");
+ *                // if the currently inflight message has finished
+ *                self->io_reset(self->io_ctx, 0, -1);
+ *                // set state to none
+ *                self->inflight_wr_op.op = TXPC_OP_NONE;
+ *                goto done;
+ *             }
+ *
+ *        break;
+ *
+ *        case TXPC_OP_STOP:
+ *            // send disconnect message
+ *            // set state to none
+ *        break;
+ *
+ *        case TXPC_OP_SET_CRC:
+ *            // send crc bits message
+ *            // wait for SIG_CRC_RECVD assertion
+ *            if(self->signals & SIG_CRC_RECVD) {
+ *                // set state to none
+ *                self->inflight_wr_op.op = TXPC_OP_NONE;
+ *                self->signals &= ~SIG_CRC_RECVD;
+ *            }
+ *        break;
+ *
+ *        case TXPC_OP_SET_ENDIANNESS:
+ *            // send endianness message
+ *            // wait for SIG_ENDIANNESS_RECVD assertion
+ *            // set state to none
  *        break;
  *
  *        default:

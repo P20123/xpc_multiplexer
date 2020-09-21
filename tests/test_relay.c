@@ -123,8 +123,8 @@ int main(void) {
     // send reset
     xpc_relay_send_reset(&uut1);
     printf("UUT1\n");
-    /*xpc_wr_op_continue(&uut1);*/
-    xpc_send_block(ctx1.write_fd, 1, 0, 0, NULL, 0); // manual reset
+    xpc_wr_op_continue(&uut1);
+    /*xpc_send_block(ctx1.write_fd, 1, 0, 0, NULL, 0); // manual reset*/
     /*uut1.signals &= ~SIG_RST_SEND;*/
 
 
@@ -142,6 +142,8 @@ int main(void) {
 
     // reset sequence complete, send a message!
     printf("UUT1\n");
+    // an extra wr op is required, since we are in reset until rx sm gets reply
+    xpc_wr_op_continue(&uut1);
     xpc_send_msg(&uut1, 1, 1, "hello uut2!\n", 12);
     xpc_wr_op_continue(&uut1);
     printf("UUT2\n");
