@@ -25,22 +25,14 @@
 
 
 /**
- * This is a convenience type that allows both read and write operations to have
- * the same function signature.
- */
-typedef union {
-    char *write_buf;
-    char **read_buf;
-} io_buf_t;
-
-/**
  * IO wrapping function type declaration.  The XPC Relay uses functions of this
  * type to abstract read and write operations to a single endpoint.
- * The pointer at buffer should be left unchanged in the write call.  In a read
- * call, if the read_buf is set, data of no more than bytes_max length
- * should be written to memory at *(char*)read_buf. If read_buf is NULL, then
- * the read_buf pointer should be adjusted to point to where the io subsystem
- * has stored the incoming data.
+ *
+ * Write calls: buffer points to a char * of length bytes_max
+ * Read calls: if buffer points to non-null, read bytes_max bytes into the
+ * region at *buffer, else save to a dynamic region, and write *buffer such that
+ * it points to the first byte of data read.
+ *
  * @param io_ctx will be passed to the io wrapper when it is called. The value
  * will be that of the io_ctx in the XPC Relay when it was configured.
  * @param buffer mutable pointer to either data (write) or NULL (read).
@@ -52,7 +44,7 @@ typedef union {
  * such the IO functions must maintain their own state and memory.
  * @return the actual number of bytes read or written.
  */
-typedef int (io_wrap_fn)(void *io_ctx, io_buf_t buffer, size_t bytes_max);
+typedef int (io_wrap_fn)(void *io_ctx, char **buffer, size_t bytes_max);
 
 /**
  * Function type for reset callbacks.  When a full message has been received,
@@ -142,7 +134,7 @@ typedef struct {
         int total_bytes;
         int bytes_complete;
         txpc_hdr_t msg_hdr;
-        io_buf_t buf;
+        char *buf;
     } inflight_wr_op, inflight_rd_op;
 } xpc_relay_state_t;
 

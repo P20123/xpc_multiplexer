@@ -26,13 +26,13 @@ xpc_relay_state_t *xpc_relay_config(
     target->inflight_wr_op.total_bytes = 0;
     target->inflight_wr_op.bytes_complete = 0;
     target->inflight_wr_op.msg_hdr = (txpc_hdr_t){0};
-    target->inflight_wr_op.buf = (io_buf_t){0};
+    target->inflight_wr_op.buf = NULL;
     // read operation
     target->inflight_rd_op.op = TXPC_OP_NONE;
     target->inflight_rd_op.total_bytes = 0;
     target->inflight_rd_op.bytes_complete = 0;
     target->inflight_rd_op.msg_hdr = (txpc_hdr_t){0};
-    target->inflight_rd_op.buf = (io_buf_t){0};
+    target->inflight_rd_op.buf = NULL;
 done:
     return target;
 }
@@ -70,7 +70,8 @@ xpc_status_t xpc_send_msg(xpc_relay_state_t *self, uint8_t to, uint8_t from, cha
     self->inflight_wr_op.msg_hdr = (txpc_hdr_t){
         .size = bytes, .to = to, .from = from, .type = 5
     };
-    self->inflight_wr_op.buf.write_buf = data;
+    self->inflight_wr_op.buf = data;
+    self->inflight_wr_op.bytes_complete = 0;
     self->inflight_wr_op.total_bytes = sizeof(txpc_hdr_t) + bytes;
     self->inflight_wr_op.op = TXPC_OP_MSG;
 done:
@@ -94,7 +95,7 @@ xpc_status_t xpc_wr_op_continue(xpc_relay_state_t *self) {
             self->inflight_wr_op.msg_hdr = (txpc_hdr_t){
                 .size = 0, .type = 1, .to = 0, .from = 0
             };
-            self->inflight_wr_op.buf = (io_buf_t){0};
+            self->inflight_wr_op.buf = NULL;
             self->inflight_wr_op.total_bytes = sizeof(txpc_hdr_t);
             printf("starting reset write sequence\n");
         }
@@ -114,16 +115,15 @@ xpc_status_t xpc_wr_op_continue(xpc_relay_state_t *self) {
     // write the message header first, if it has not been sent yet.
     if(self->inflight_wr_op.bytes_complete < sizeof(txpc_hdr_t)) {
         printf("doing header write\n");
-        io_buf_t buf;
-        buf.write_buf = (char*)&self->inflight_wr_op.msg_hdr;
-        bytes = self->write(self->io_ctx, buf, sizeof(txpc_hdr_t));
+        char *buf = (char*)&self->inflight_wr_op.msg_hdr;
+        bytes = self->write(self->io_ctx, &buf, sizeof(txpc_hdr_t));
         self->inflight_wr_op.bytes_complete += bytes;
     }
     if(self->inflight_wr_op.bytes_complete < self->inflight_wr_op.total_bytes &&
             self->inflight_wr_op.bytes_complete >= sizeof(txpc_hdr_t)) {
         printf("doing payload write\n");
         bytes = self->write(
-            self->io_ctx, self->inflight_wr_op.buf, self->inflight_wr_op.total_bytes - self->inflight_wr_op.bytes_complete - sizeof(txpc_hdr_t)
+            self->io_ctx, &self->inflight_wr_op.buf, self->inflight_wr_op.total_bytes - self->inflight_wr_op.bytes_complete
         );
         self->inflight_wr_op.bytes_complete += bytes;
     }
@@ -209,28 +209,28 @@ xpc_status_t xpc_rd_op_continue(xpc_relay_state_t *self) {
         goto done;
     }
 
-    int starting_state = self->inflight_rd_op.op;
+    int starting_state = -1;
     bool do_payload_read = false;
     int bytes = 0;
 
     do {
         bytes = 0;
+        starting_state = self->inflight_rd_op.op;
         // read in new bytes
         if(self->inflight_rd_op.bytes_complete < sizeof(txpc_hdr_t)) {
             printf("doing header read\n");                
-            io_buf_t buf;
-            buf.read_buf = (char**)&self->inflight_rd_op.msg_hdr;
+            char *buf = (char*)&self->inflight_rd_op.msg_hdr;
             bytes = self->read(
                 self->io_ctx,
-                buf,
+                &buf,
                 sizeof(txpc_hdr_t)
             );
         }
         else if(do_payload_read){
-            printf("doing payload read\n");                
+            printf("doing payload read\n");
             bytes = self->read(
                 self->io_ctx,
-                self->inflight_rd_op.buf,
+                &self->inflight_rd_op.buf,
                 self->inflight_rd_op.total_bytes - self->inflight_rd_op.bytes_complete
             );
         }
@@ -285,12 +285,13 @@ xpc_status_t xpc_rd_op_continue(xpc_relay_state_t *self) {
                     // we did not initiate, stay here until SIG_RST_RECVD
                     // is de-asserted by tx sm
                     if(self->signals & SIG_RST_RECVD) {
-                        self->inflight_rd_op.op = TXPC_OP_RESET;
+                        self->inflight_rd_op.op = TXPC_OP_WAIT_RESET;
                     }
                     else {
                         self->inflight_rd_op.op = TXPC_OP_NONE;
                         self->inflight_rd_op.bytes_complete = 0;
                         self->inflight_rd_op.total_bytes = 0;
+                        self->inflight_rd_op.buf = NULL;
                     }
                 }
             break;
@@ -301,10 +302,7 @@ xpc_status_t xpc_rd_op_continue(xpc_relay_state_t *self) {
                     printf("got a complete message\n");
                     // msg complete
                     do_payload_read = false;
-                    self->inflight_rd_op.op = TXPC_OP_NONE;
-                    self->inflight_rd_op.bytes_complete = 0;
-                    self->inflight_rd_op.total_bytes = 0;
-                    self->dispatch_cb(self->msg_ctx, &self->inflight_rd_op.msg_hdr, *self->inflight_rd_op.buf.read_buf);
+                    self->inflight_rd_op.op = TXPC_OP_WAIT_DISPATCH;
                 }
                 else {
                     do_payload_read = true;
@@ -312,11 +310,20 @@ xpc_status_t xpc_rd_op_continue(xpc_relay_state_t *self) {
 
             break;
 
+            case TXPC_OP_WAIT_DISPATCH:
+                if(self->dispatch_cb(self->msg_ctx, &self->inflight_rd_op.msg_hdr, self->inflight_rd_op.buf)) {
+                    self->inflight_rd_op.op = TXPC_OP_NONE;
+                    self->inflight_rd_op.total_bytes = 0;
+                    self->inflight_rd_op.bytes_complete = 0;
+                    self->io_reset(self->io_ctx, 1, -1);
+                    goto done;
+                }
+            break;
+
         }
 
-    // loop while state changed and bytes read (more to process)
-    } while(self->inflight_rd_op.op != starting_state &&
-            self->inflight_rd_op.total_bytes - self->inflight_rd_op.total_bytes > 0);
+    // loop while state changed
+    } while(self->inflight_rd_op.op != starting_state);
 
 done:
     return status;
