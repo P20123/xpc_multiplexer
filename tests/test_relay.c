@@ -16,28 +16,31 @@ typedef struct {
     char read_buf[255];
 } test_io_ctx_t;
 
-int test_read_wrapper(void *io_ctx, char **buffer, size_t bytes_max) {
+int test_read_wrapper(void *io_ctx, char **buffer, int offset, size_t bytes_max) {
     test_io_ctx_t *ctx = (test_io_ctx_t*)io_ctx;
     int bytes = 0;
     // read into the specified location if read_buf is set, otherwise store it
     // in our own context.
     if(*buffer == NULL) {
-        bytes = read(ctx->read_fd, ctx->read_buf + ctx->read_offset, bytes_max);
+        bytes = read(ctx->read_fd, ctx->read_buf + offset, bytes_max);
         // tell the relay where we read into
         *buffer = (char*)ctx->read_buf;
-        if(bytes > 0) {
-            ctx->read_offset += bytes;
-        }
     }
     else {
         bytes = read(ctx->read_fd, *buffer, bytes_max);
     }
+    if(bytes > 0) {
+        ctx->read_offset += bytes;
+    }
+    else {
+        bytes = 0;
+    }
     return bytes > 0 ? bytes:0;
 }
 
-int test_write_wrapper(void *io_ctx, char **buffer, size_t bytes_max) {
+int test_write_wrapper(void *io_ctx, char **buffer, int offset, size_t bytes_max) {
     test_io_ctx_t *ctx = (test_io_ctx_t*)io_ctx;
-    int bytes = write(ctx->write_fd, *buffer + ctx->write_offset, bytes_max);
+    int bytes = write(ctx->write_fd, *buffer + offset, bytes_max);
     if(bytes > 0) {
         ctx->write_offset += bytes;
     }
@@ -143,6 +146,7 @@ int main(void) {
     // reset sequence complete, send a message!
     printf("UUT1\n");
     // an extra wr op is required, since we are in reset until rx sm gets reply
+    // and the next write operation occurs.
     xpc_wr_op_continue(&uut1);
     xpc_send_msg(&uut1, 1, 1, "hello uut2!\n", 12);
     xpc_wr_op_continue(&uut1);

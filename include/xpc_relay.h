@@ -33,9 +33,14 @@
  * region at *buffer, else save to a dynamic region, and write *buffer such that
  * it points to the first byte of data read.
  *
+ * The purpose of having the offset is to allow the io structure to be opaque
+ * to the relay. The relay may change this value at any time, and it may also
+ * change the buffer location between subsequent calls in the same message.
+ *
  * @param io_ctx will be passed to the io wrapper when it is called. The value
  * will be that of the io_ctx in the XPC Relay when it was configured.
  * @param buffer mutable pointer to either data (write) or NULL (read).
+ * @param offset number of bytes into buffer to start io at.
  * @param bytes_max the size of data to write from buffer, or to read from the
  * IO stream.  On a read, this is the number of bytes that should be read from
  * the stream. The value of bytes_max will decrease by whatever value the
@@ -44,7 +49,7 @@
  * such the IO functions must maintain their own state and memory.
  * @return the actual number of bytes read or written.
  */
-typedef int (io_wrap_fn)(void *io_ctx, char **buffer, size_t bytes_max);
+typedef int (io_wrap_fn)(void *io_ctx, char **buffer, int offset, size_t bytes_max);
 
 /**
  * Function type for reset callbacks.  When a full message has been received,

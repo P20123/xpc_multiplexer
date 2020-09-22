@@ -152,13 +152,14 @@ xpc_status_t xpc_wr_op_continue(xpc_relay_state_t *self) {
         if(self->inflight_wr_op.bytes_complete < sizeof(txpc_hdr_t) && self->inflight_wr_op.total_bytes > 0) {
             printf("doing header write\n");
             char *buf = (char*)&self->inflight_wr_op.msg_hdr;
-            bytes = self->write(self->io_ctx, &buf, sizeof(txpc_hdr_t));
+            bytes = self->write(self->io_ctx, &buf, self->inflight_wr_op.bytes_complete, sizeof(txpc_hdr_t));
         }
         else if(do_payload_write) {
             printf("doing payload write\n");
             bytes = self->write(
                 self->io_ctx,
                 &self->inflight_wr_op.buf,
+                self->inflight_wr_op.bytes_complete - sizeof(txpc_hdr_t),
                 self->inflight_wr_op.total_bytes - self->inflight_wr_op.bytes_complete
             );
         }
@@ -189,6 +190,7 @@ xpc_status_t xpc_rd_op_continue(xpc_relay_state_t *self) {
             bytes = self->read(
                 self->io_ctx,
                 &buf,
+                self->inflight_rd_op.bytes_complete,
                 sizeof(txpc_hdr_t)
             );
         }
@@ -197,6 +199,7 @@ xpc_status_t xpc_rd_op_continue(xpc_relay_state_t *self) {
             bytes = self->read(
                 self->io_ctx,
                 &self->inflight_rd_op.buf,
+                self->inflight_rd_op.bytes_complete - sizeof(txpc_hdr_t),
                 self->inflight_rd_op.total_bytes - self->inflight_rd_op.bytes_complete
             );
         }
