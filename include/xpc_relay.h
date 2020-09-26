@@ -51,6 +51,7 @@
  */
 typedef int (io_wrap_fn)(void *io_ctx, char **buffer, int offset, size_t bytes_max);
 
+
 /**
  * Function type for reset callbacks.  When a full message has been received,
  * the xpc relay will inform the IO subsystem that it can discard that size in
@@ -64,10 +65,31 @@ typedef int (io_wrap_fn)(void *io_ctx, char **buffer, int offset, size_t bytes_m
  */
 typedef void (io_reset_fn)(void *io_ctx, int which, size_t bytes);
 
+
 /**
  * Function type for incoming message handling.
  */
 typedef bool (dispatch_fn)(void *msg_ctx, txpc_hdr_t *msg_hdr, char *payload);
+
+
+/**
+ * Function type for computing a CRC.  The returned pointer should contain
+ * a CRC of the number of bits specified by crc_bits.
+ * @param crc_ctx context for the CRC subsystem, as passed in xpc_relay_config.
+ * @param buf pointer to contiguous memory to compute the CRC of.
+ * @param bytes number of bytes at buf to compute CRC of.
+ * @return storage location of the computed CRC.
+ */
+typedef char *(crc_fn)(void *crc_ctx, char *buf, size_t bytes);
+
+/**
+ * Function to change the generator polynomial for the CRC subsystem.
+ * @param crc_ctx context for the CRC subsystem, as passed in xpc_relay_config.
+ * @param crc_bits number of bits in the CRC generator polynomial.
+ * @param polyn pointer to contiguous memory containing the coefficients.
+ */
+typedef void (crc_polyn_config)(void *crc_ctx, int crc_bits, char *polyn);
+
 
 typedef enum {
     TXPC_OP_NONE,
@@ -92,31 +114,31 @@ typedef enum {
 } xpc_status_t;
 
 typedef struct {
-    // global state for the xpc connection
-    bool use_le;
-    bool connection_ready;
     int crc_bits;
-    // contexts for the io subsystem and application message handler
+    int require_msg_ack;
+} xpc_config_t;
+
+typedef struct {
+    // global state for the xpc connection
+    xpc_config_t conn_config;
+    // contexts for the io subsystem, message handler, and crc subsystem.
     void *io_ctx;
     void *msg_ctx;
-    // function pointers for io and application message handling
+    void *crc_ctx;
+    // function pointers for io, message handling, and crc subsystem.
     io_wrap_fn *write;
     io_wrap_fn *read;
     io_reset_fn *io_reset;
     dispatch_fn *dispatch_cb;
-    // TODO add a CRC function
-    // TODO figure out crc callback points
+    crc_fn *crc;
     // These are signals between the two state machines.
     // the _SEND signals are asserted by the entry point functions, and not
-    // by the write state machine.
-    // FIXME how do we make sync the read and write sms so they don't do
-    // an infinite reset loop?
-    // Only RST, CRC, and ENDIANNESS are ack'd with a clone response.
-    // thus, the entry point functions ASSERT those _SEND signals, and
-    // xpc_op_read_continue DEASSERTS them when the ack is received.
-    // all others, xpc_op_write_continue deasserts after message transmission
-    // is complete.
-    // We do NOT allow messages to be sent while waiting for an ack.
+    // by the write state machine.  Signals requiring acknowledgement are
+    // de-asserted from the read state machine.  The write state machine will
+    // return to normal operation on the next call to xpc_wr_op_continue.
+    // The same is true of the read signals.  The read state machine asserts
+    // _RECVD, and the write state machine deasserts them when the reply has
+    // been sent.
     enum int_sig_t {
         // a reset message was received from the endpoint, invalidate write
         // state.
@@ -151,17 +173,20 @@ typedef struct {
  * @param io_ctx pointer to the context for the IO read/write callbacks.
  * @param msg_ctx pointer to the context for handling message events
  * (recvd, failed, disconnect)
+ * @param crc_ctx pointer to the context for crc computations
  * @param write the IO wrapper for writing a byte stream to the endpoint
  * @param read the IO wrapper for reading a byte stream from an endpoint
  * @param msg_handle_cb message handler callback function, called on any
  * message event.
+ * @param crc crc computation callback function, called when verifying the crc
+ * on message read, and when computing the crc of a message payload to send.
  *
  * @return target, or NULL on failure.
  */
 xpc_relay_state_t *xpc_relay_config(
-    xpc_relay_state_t *target, void *io_ctx, void *msg_ctx,
+    xpc_relay_state_t *target, void *io_ctx, void *msg_ctx, void *crc_ctx,
     io_wrap_fn *write, io_wrap_fn *read, io_reset_fn *reset,
-    dispatch_fn *msg_handle_cb
+    dispatch_fn *msg_handle_cb, crc_fn *crc
 );
 
 /**

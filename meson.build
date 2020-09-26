@@ -118,7 +118,7 @@ if ext_cmocka.found() and should_build_tests
         [
             'tests/test_relay.c',
             'src/xpc_relay.c',
-            'src/epoll_app.c'
+            'src/crc.c'
         ],
         include_directories: includes,
         link_with:
