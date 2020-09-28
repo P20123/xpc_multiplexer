@@ -3,15 +3,21 @@
 #include <stddef.h>
 #include <stdio.h> // temp, FIXME
 #include <xpc_relay.h>
+// notes:
+//  - we can make resets/flow controls async by calling io_reset mid-msg, but
+//  that would be living life dangerously.
+//  - crc_bits >> 3 is wrong.  Consider the case of a 33 bit crc.
+//  - crc_config should support seed settings, inversion, byte swapping...
 
 xpc_relay_state_t *xpc_relay_config(
     xpc_relay_state_t *target, void *io_ctx, void *msg_ctx, void *crc_ctx,
     io_wrap_fn *write, io_wrap_fn *read, io_reset_fn *reset,
-    dispatch_fn *msg_handle_cb, crc_fn *crc
+    io_notify_config *io_notify, dispatch_fn *msg_handle_cb,
+    crc_fn *crc, crc_polyn_config *crc_config
 ) {
     if(target == NULL) goto done;
     // global state
-    target->conn_config = (xpc_config_t){.crc_bits = 0, .require_msg_ack = 0};
+    target->conn_config = (xpc_config_t){.crc_bits = 0, .flags = 0};
     // contexts
     target->io_ctx = io_ctx;
     target->msg_ctx = msg_ctx;
@@ -20,8 +26,10 @@ xpc_relay_state_t *xpc_relay_config(
     target->write = write;
     target->read = read;
     target->io_reset = reset;
+    target->io_notify = io_notify;
     target->dispatch_cb = msg_handle_cb;
     target->crc = crc;
+    target->crc_config = crc_config;
     // write operation
     target->inflight_wr_op.op = TXPC_OP_NONE;
     target->inflight_wr_op.total_bytes = 0;
@@ -44,19 +52,62 @@ xpc_status_t xpc_relay_send_reset(xpc_relay_state_t *self) {
         status = TXPC_STATUS_BAD_STATE;
         goto done;
     }
-    if(self->inflight_wr_op.op != TXPC_OP_NONE ||
-            // FIXME... what if we need to reset mid-message?
-            self->inflight_rd_op.op != TXPC_OP_NONE) {
+    if(self->inflight_wr_op.op != TXPC_OP_NONE) { // || self->inflight_rd_op.op != TXPC_OP_NONE) {
         status = TXPC_STATUS_INFLIGHT;
         goto done;
     }
-        self->signals |= SIG_RST_SEND;
+    else if(self->signals & SIG_XOFF_RECVD) {
+        status = TXPC_STATUS_INHIBIT;
+        goto done;
+    }
+    self->signals |= SIG_RST_SEND;
+    self->inflight_wr_op.op = TXPC_OP_RESET;
+    self->inflight_wr_op.bytes_complete = 0;
+    self->inflight_wr_op.total_bytes = sizeof(txpc_hdr_t);
+    self->inflight_wr_op.msg_hdr = (txpc_hdr_t){
+        .type = 1, .size = 0, .to = 0, .from = 0
+    };
+    self->io_notify(self->io_ctx, 1, true);
 done:
     return status;
 }
 
-xpc_status_t xpc_relay_send_disconnect(xpc_relay_state_t *self) {
+xpc_status_t xpc_relay_send_config(
+        xpc_relay_state_t *self,
+        int crc_bits, char *crc_polyn,
+        bool msg_sync_ack) {
+    int status = TXPC_STATUS_DONE;
+    if(self == NULL) {
+        status = TXPC_STATUS_BAD_STATE;
+        goto done;
+    }
+    if(self->inflight_wr_op.op != TXPC_OP_NONE) {
+        status = TXPC_STATUS_INFLIGHT;
+        goto done;
+    }
+    else if(self->signals & SIG_XOFF_RECVD) {
+        status = TXPC_STATUS_INHIBIT;
+        goto done;
+    }
+    self->inflight_wr_op.msg_hdr = (txpc_hdr_t) {
+        .type = 2, .size = 1 + 1 + (crc_bits >> 3), .to = 0, .from = 0
+    };
+    self->inflight_wr_op.buf = crc_polyn;
+    self->inflight_wr_op.total_bytes = sizeof(txpc_hdr_t) + self->inflight_wr_op.msg_hdr.size;
+    self->inflight_wr_op.bytes_complete = 0;
+    self->inflight_wr_op.op = TXPC_OP_CONFIG;
+
+    self->conn_config.crc_bits = crc_bits;
+    self->conn_config.flags = msg_sync_ack;
+
+    self->crc_config(self->crc_ctx, crc_bits, crc_polyn);
+    /*self->signals |= SIG_CONFIG_SEND; // XXX what is this for?*/
+    self->io_notify(self->io_ctx, 1, true);
+done:
+    return status;
+    
 }
+
 
 xpc_status_t xpc_send_msg(xpc_relay_state_t *self, uint8_t to, uint8_t from, char *data, size_t bytes) {
     int status = TXPC_STATUS_DONE;
@@ -68,6 +119,10 @@ xpc_status_t xpc_send_msg(xpc_relay_state_t *self, uint8_t to, uint8_t from, cha
         status = TXPC_STATUS_INFLIGHT;
         goto done;
     }
+    else if(self->signals & SIG_XOFF_RECVD) {
+        status = TXPC_STATUS_INHIBIT;
+        goto done;
+    }
     self->inflight_wr_op.msg_hdr = (txpc_hdr_t){
         .size = bytes, .to = to, .from = from, .type = 5
     };
@@ -77,6 +132,7 @@ xpc_status_t xpc_send_msg(xpc_relay_state_t *self, uint8_t to, uint8_t from, cha
     self->inflight_wr_op.total_bytes =
         sizeof(txpc_hdr_t) + bytes + (self->conn_config.crc_bits >> 3);
     self->inflight_wr_op.op = TXPC_OP_MSG;
+    self->io_notify(self->io_ctx, 1, true);
 done:
     return status;
 }
@@ -96,6 +152,9 @@ xpc_status_t xpc_wr_op_continue(xpc_relay_state_t *self) {
     bool prev_payload_write = false;
     bool do_crc_write = false;
     char *crc_location = NULL;
+    char *payload_location = NULL;
+    int write_size = 0;
+    int write_offset = 0;
     int bytes = 0;
     do {
         bytes = 0;
@@ -103,8 +162,13 @@ xpc_status_t xpc_wr_op_continue(xpc_relay_state_t *self) {
 
         switch(self->inflight_wr_op.op) {
             case TXPC_OP_NONE:
-                // check wr signals here
-                if(self->signals & SIG_RST_SEND || self->signals & SIG_RST_RECVD) {
+                // check rd signals here
+                if(self->signals & SIG_XOFF_RECVD) {
+                    // inhibit all operations until this signal is de-asserted.
+                    status = TXPC_STATUS_INHIBIT;
+                    goto done; // short circuit to the end
+                }
+                if(self->signals & SIG_RST_RECVD) {
                     self->inflight_wr_op.op = TXPC_OP_RESET;
                     self->inflight_wr_op.bytes_complete = 0;
                     self->inflight_wr_op.total_bytes = sizeof(txpc_hdr_t);
@@ -112,8 +176,8 @@ xpc_status_t xpc_wr_op_continue(xpc_relay_state_t *self) {
                         .type = 1, .size = 0, .to = 0, .from = 0
                     };
                 }
-                // ... other cases here
-
+                // turn off write notifications if there is no msg to send
+                self->io_notify(self->io_ctx, 1, false);
             break;
 
             case TXPC_OP_RESET:
@@ -139,8 +203,11 @@ xpc_status_t xpc_wr_op_continue(xpc_relay_state_t *self) {
             break;
 
             case TXPC_OP_MSG:
+                write_offset = self->inflight_wr_op.bytes_complete - sizeof(txpc_hdr_t);
                 prev_payload_write = do_payload_write;
                 do_payload_write = true;
+                payload_location = self->inflight_wr_op.buf;
+                write_size = self->inflight_wr_op.total_bytes - self->inflight_wr_op.bytes_complete - (self->conn_config.crc_bits >> 3);
                 if(self->inflight_wr_op.bytes_complete
                         == self->inflight_wr_op.total_bytes) {
                     // if the currently inflight message has finished
@@ -158,6 +225,7 @@ xpc_status_t xpc_wr_op_continue(xpc_relay_state_t *self) {
                         == self->inflight_wr_op.msg_hdr.size
                         + sizeof(txpc_hdr_t)) {
                     // hdr + payload sent, but not crc
+                    write_offset = 0;
                     self->io_reset(self->io_ctx, 0, -1);
                     crc_location = self->crc(
                         self->crc_ctx,
@@ -168,6 +236,43 @@ xpc_status_t xpc_wr_op_continue(xpc_relay_state_t *self) {
                     do_payload_write = false;
                     do_crc_write = true;
                 }
+            break;
+
+            case TXPC_OP_CONFIG:
+                printf("sending config msg\n");
+                do_payload_write = true;
+                if(self->inflight_wr_op.bytes_complete
+                        == self->inflight_wr_op.total_bytes) {
+                    // if the currently inflight message has finished
+                    self->io_reset(self->io_ctx, 0, -1);
+                    // set state to none
+                    self->inflight_wr_op.op = TXPC_OP_NONE;
+                    prev_payload_write = do_payload_write;
+                    self->inflight_wr_op.total_bytes = 0;
+                    self->inflight_wr_op.bytes_complete = 0;
+                    do_payload_write = false;
+                    do_crc_write = false;
+                }
+                else if(self->inflight_wr_op.bytes_complete == sizeof(txpc_hdr_t) + 2) {
+                    // hdr + mode + crc_bits sent, send polyn now
+                    payload_location = self->inflight_wr_op.buf;
+                    write_size = self->conn_config.crc_bits >> 3;
+                }
+                else if(self->inflight_wr_op.bytes_complete == sizeof(txpc_hdr_t) + 1) {
+                    // hdr + mode sent
+                    payload_location = (char*)&self->conn_config.crc_bits;
+                    write_size = 1;
+
+                }
+                else if(self->inflight_wr_op.bytes_complete == sizeof(txpc_hdr_t)) {
+                    // hdr only
+                    payload_location = (char*)&self->conn_config.flags;
+                    write_size = 1;
+                }
+            break;
+
+            case TXPC_OP_ACK:
+
             break;
         }
 
@@ -180,9 +285,9 @@ xpc_status_t xpc_wr_op_continue(xpc_relay_state_t *self) {
             printf("doing payload write\n");
             bytes = self->write(
                 self->io_ctx,
-                &self->inflight_wr_op.buf,
-                self->inflight_wr_op.bytes_complete - sizeof(txpc_hdr_t),
-                self->inflight_wr_op.total_bytes - self->inflight_wr_op.bytes_complete - (self->conn_config.crc_bits >> 3)
+                &payload_location,
+                write_offset,
+                write_size
             );
         }
         else if(do_crc_write) {
@@ -209,6 +314,7 @@ xpc_status_t xpc_rd_op_continue(xpc_relay_state_t *self) {
 
     int starting_state = -1;
     bool do_payload_read = false;
+    bool prev_payload_read = false;
     bool do_crc_read = false;
     char *crc_location = NULL;
     int bytes = 0;
@@ -264,10 +370,19 @@ xpc_status_t xpc_rd_op_continue(xpc_relay_state_t *self) {
                             }
                         break;
 
+                        // config
+                        case 2:
+                            self->inflight_rd_op.op = TXPC_OP_WAIT_CONFIG;
+                            self->inflight_rd_op.total_bytes = self->inflight_rd_op.msg_hdr.size + sizeof(txpc_hdr_t);
+                            prev_payload_read = do_payload_read;
+                            do_payload_read = true;
+                        break;
+
                         // msg
                         case 5:
                             self->inflight_rd_op.op = TXPC_OP_WAIT_MSG;
                             self->inflight_rd_op.total_bytes = self->inflight_rd_op.msg_hdr.size + sizeof(txpc_hdr_t) + (self->conn_config.crc_bits >> 3);
+                            prev_payload_read = do_payload_read;
                             do_payload_read = true;
                         break;
                     }
@@ -306,6 +421,7 @@ xpc_status_t xpc_rd_op_continue(xpc_relay_state_t *self) {
                     // incorrect sequence received, reset read ctx, try again.
                     self->io_reset(self->io_ctx, 1, 5);
                     self->inflight_rd_op.bytes_complete = 0;
+                    self->inflight_rd_op.total_bytes = 0;
                 }
             break;
 
@@ -345,11 +461,13 @@ xpc_status_t xpc_rd_op_continue(xpc_relay_state_t *self) {
                         >= self->inflight_rd_op.msg_hdr.size
                         + sizeof(txpc_hdr_t)) {
                     // hdr + payload recv'd, crc in transit
+                    prev_payload_read = do_payload_read;
                     do_payload_read = false;
                     do_crc_read = true;
                 }
                 else {
                     // hdr recv'd, payload and possible crc in transit.
+                    prev_payload_read = do_payload_read;
                     do_payload_read = true;
                 }
 
@@ -361,6 +479,30 @@ xpc_status_t xpc_rd_op_continue(xpc_relay_state_t *self) {
                     self->inflight_rd_op.total_bytes = 0;
                     self->inflight_rd_op.bytes_complete = 0;
                     self->io_reset(self->io_ctx, 1, -1);
+                    goto done;
+                }
+            break;
+
+            case TXPC_OP_WAIT_CONFIG:
+                printf("reading config msg\n");
+                prev_payload_read = do_payload_read;
+                do_payload_read = true;
+                do_crc_read = false;
+                if(self->inflight_rd_op.bytes_complete
+                        == self->inflight_rd_op.total_bytes) {
+                    printf("config msg done\n");
+                    // if the currently inflight message has finished
+                    self->inflight_rd_op.total_bytes = 0;
+                    self->inflight_rd_op.bytes_complete = 0;
+                    self->io_reset(self->io_ctx, 1, -1);
+                    // set state to none
+                    self->inflight_rd_op.op = TXPC_OP_NONE;
+                    prev_payload_read = do_payload_read;
+                    do_payload_read = false;
+                    do_crc_read = false;
+                    self->conn_config.flags = self->inflight_rd_op.buf[0];
+                    self->conn_config.crc_bits = self->inflight_rd_op.buf[1];
+                    self->crc_config(self->crc_ctx, self->conn_config.crc_bits, self->inflight_rd_op.buf + 2);
                     goto done;
                 }
             break;

@@ -2,11 +2,6 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <tinyxpc/tinyxpc.h>
-// NOTE:
-// not supporting streams right now.  we are assuming in-order message
-// processing for the standard messages, so any nacks are for the most recently
-// sent message. (not that we can do anything about it.)
-
 /**
  * XPC Relay definitions
  *
@@ -65,6 +60,15 @@ typedef int (io_wrap_fn)(void *io_ctx, char **buffer, int offset, size_t bytes_m
  */
 typedef void (io_reset_fn)(void *io_ctx, int which, size_t bytes);
 
+/**
+ * Function type for IO notification flow control.  The XPC Relay will call
+ * these to inform the IO subsystem when to disable read/write notifications.
+ * @param io_ctx io_ctx set at initialization of xpc_relay_config
+ * @param which 0 if read, 1 if write
+ * @param enable true if the relay should be notified of events, false otherwise
+ */
+typedef void (io_notify_config)(void *io_ctx, int which, bool enable);
+
 
 /**
  * Function type for incoming message handling.
@@ -95,27 +99,34 @@ typedef enum {
     TXPC_OP_NONE,
     TXPC_OP_RESET,
     TXPC_OP_MSG,
-    TXPC_OP_STOP,
-    TXPC_OP_SET_CRC,
-    TXPC_OP_SET_ENDIANNESS,
+    TXPC_OP_CONFIG,
+    TXPC_OP_ACK,
     // these are aliased to minimize the state variable size, but are more
     // readable when looking through the read state machine.
     TXPC_OP_WAIT_RESET = TXPC_OP_RESET,
     TXPC_OP_WAIT_MSG = TXPC_OP_MSG,
-    TXPC_OP_WAIT_CRC = TXPC_OP_SET_CRC,
-    TXPC_OP_WAIT_ENDIANNESS = TXPC_OP_SET_ENDIANNESS,
+    TXPC_OP_WAIT_CONFIG = TXPC_OP_CONFIG,
+    TXPC_OP_WAIT_ACK = TXPC_OP_ACK,
     TXPC_OP_WAIT_DISPATCH
 } xpc_sm_state_t;
 
 typedef enum {
     TXPC_STATUS_DONE,
     TXPC_STATUS_INFLIGHT,
+    TXPC_STATUS_INHIBIT,
     TXPC_STATUS_BAD_STATE
 } xpc_status_t;
 
 typedef struct {
-    int crc_bits;
-    int require_msg_ack;
+    unsigned char crc_bits;
+    // there has to be a better way to express this. FIXME.
+    union {
+        unsigned char flags;
+        enum {
+            CONFIG_MASK_RESERVED = 0xfe,
+            CONFIG_FLAGS_REQ_ACK = 0x01
+        } flag_defs;
+    };
 } xpc_config_t;
 
 typedef struct {
@@ -129,8 +140,10 @@ typedef struct {
     io_wrap_fn *write;
     io_wrap_fn *read;
     io_reset_fn *io_reset;
+    io_notify_config *io_notify;
     dispatch_fn *dispatch_cb;
     crc_fn *crc;
+    crc_polyn_config *crc_config;
     // These are signals between the two state machines.
     // the _SEND signals are asserted by the entry point functions, and not
     // by the write state machine.  Signals requiring acknowledgement are
@@ -145,14 +158,11 @@ typedef struct {
         SIG_RST_RECVD = 1,
         // this endpoint is sending a reset message, invalidate read state.
         SIG_RST_SEND = (1 << 1),
-        // a disconnect message was received from the endpoint.
-        SIG_DISC_RECVD = (1 << 2),
-        // this endpoint is sending a disconnect message, invalidate read state.
-        SIG_DISC_SEND = (1 << 3),
-        SIG_CRC_RECVD = (1 << 4),
-        SIG_CRC_SEND = (1 << 5),
-        SIG_ENDIANNESS_RECVD = (1 << 6),
-        SIG_ENDIANNESS_SEND = (1 << 7)
+        SIG_CONFIG_RECVD = (1 << 2),
+        SIG_CONFIG_SEND = (1 << 3),
+        SIG_XOFF_RECVD = (1 << 4),
+        SIG_ACK_RECVD = (1 << 5),
+        SIG_NACK_RECVD = (1 << 6)
     } signals;
 
     // internal state for both state machines is identical.
@@ -176,31 +186,68 @@ typedef struct {
  * @param crc_ctx pointer to the context for crc computations
  * @param write the IO wrapper for writing a byte stream to the endpoint
  * @param read the IO wrapper for reading a byte stream from an endpoint
+ * @param reset function to force buffer clear on IO subsystem
+ * @param io_notify function to enable/disable read/write notifications
  * @param msg_handle_cb message handler callback function, called on any
  * message event.
  * @param crc crc computation callback function, called when verifying the crc
  * on message read, and when computing the crc of a message payload to send.
+ * @param crc_config crc configuration function to set the parameters for the
+ * crc subsystem.
  *
  * @return target, or NULL on failure.
  */
 xpc_relay_state_t *xpc_relay_config(
     xpc_relay_state_t *target, void *io_ctx, void *msg_ctx, void *crc_ctx,
     io_wrap_fn *write, io_wrap_fn *read, io_reset_fn *reset,
-    dispatch_fn *msg_handle_cb, crc_fn *crc
+    io_notify_config *io_notify, dispatch_fn *msg_handle_cb,
+    crc_fn *crc, crc_polyn_config *crc_config
 );
 
 /**
- *
+ * Reset the connection. This should be called immediately after
+ * configuration, before any messages are sent to ensure that buffers are in
+ * sync on both ends.  Additionally, it should be sent any time that IO calls
+ * become desynchronized or bytes are lost.
+ * @param self the relay which should issue a new reset.
+ * @return TXPC_STATUS_DONE when ready to send, TXPC_STATUS_INFLIGHT if not.
  */
 xpc_status_t xpc_relay_send_reset(xpc_relay_state_t *self);
 
 /**
- *
+ * Set up the communication channel parameters.
+ * The default is no crc, no acknowledge.
+ * @param crc_bits the number of bits to use in CRC computations. 0 to disable.
+ * @param crc_polyn pointer to the CRC polynomial.
+ * @param msg_sync_ack whether or not to force synchronous acknowledgement on
+ * messages (does not apply to configuration messages or streams)
+ * @return TXPC_STATUS_DONE when ready to send, TXPC_STATUS_INFLIGHT if not.
  */
-xpc_status_t xpc_relay_send_disconnect(xpc_relay_state_t *self);
+xpc_status_t xpc_relay_send_config(
+    xpc_relay_state_t *self,
+    int crc_bits, char *crc_polyn,
+    bool msg_sync_ack
+);
 
 /**
- *
+ * Send a flow control message. Sending an XOFF message prevents messages after
+ * receipt of this message from being sent by the remote, but does not cancel
+ * any inflight messages. Sending an XON message allows flow to resume. Whether
+ * inflight message are re-transmitted is not specified.
+ * @param self the relay which should issue the message
+ * @param xon 1 to enable flow, 0 to disable.
+ */
+xpc_status_t xpc_relay_set_flow(xpc_relay_state_t *self, bool xon);
+
+/**
+ * Send a new message with optional payload to the remote endpoint.
+ * @param self the relay which should send the message
+ * @param to the "to" message field value
+ * @param from the "from" message field value
+ * @param data buffer to contiguous memory containing message payload
+ * @param bytes the number of bytes of payload, < 65536
+ * @return TXPC_STATUS_DONE when message is being sent, TXPC_STATUS_INFLIGHT
+ * if the relay is busy.
  */
 xpc_status_t xpc_send_msg(xpc_relay_state_t *self, uint8_t to, uint8_t from, char *data, size_t bytes);
 
@@ -209,8 +256,8 @@ xpc_status_t xpc_send_msg(xpc_relay_state_t *self, uint8_t to, uint8_t from, cha
  * are also enacted by this function for any write-related state transitions.
  * This function should be called when the stream associated with this
  * xpc connection is ready for writing.
- * @param self XPC Relay context
- * @return 0 if all operations are complete (no messages inflight), 1 otherwise.
+ * @param self the relay whose IO channel is ready for writing
+ * @return txpc_status_t
  */
 xpc_status_t xpc_wr_op_continue(xpc_relay_state_t *self);
 
@@ -219,7 +266,7 @@ xpc_status_t xpc_wr_op_continue(xpc_relay_state_t *self);
  * are also enacted by this function for any read-related state transitions.
  * This function should be called when the stream associated with this
  * xpc connection is ready for reading.
- * @param self XPC Relay context
- * @return 0 if all operations are complete (no messages inflight), 1 otherwise.
+ * @param self the relay whose IO channel is ready for reading
+ * @return txpc_status_t
  */
 xpc_status_t xpc_rd_op_continue(xpc_relay_state_t *self);

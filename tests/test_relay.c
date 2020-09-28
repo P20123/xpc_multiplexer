@@ -67,6 +67,32 @@ void test_reset_fn(void *io_ctx, int which, size_t bytes) {
     }
 }
 
+
+void test_io_notify_config(void *io_ctx, int which, bool enable) {
+    printf("notify config called\n");
+    /*return;*/
+}
+
+typedef struct {
+    crc_t crc;
+} crc_ctx_t;
+
+
+char *test_crc_fn(void *crc_ctx, char *buf, size_t bytes) {
+    crc_ctx_t *ctx = (crc_ctx_t*)crc_ctx;
+    ctx->crc = crc_init();
+    ctx->crc = crc_update(ctx->crc, buf, bytes);
+    ctx->crc = crc_finalize(ctx->crc);
+    return (char*)&ctx->crc;
+}
+
+
+void test_crc_polyn_config(void *crc_ctx, int crc_bits, char *crc_polyn) {
+    printf("crc config called\n");
+    return;
+}
+
+
 bool test_msg_dispatch_fn(void *msg_ctx, txpc_hdr_t *msg, char *payload) {
     printf("message dispatch called\n");
     payload[msg->size] = 0; // do not print crc at end of payload
@@ -109,13 +135,13 @@ int test_nocrc(void) {
 
     xpc_relay_config(
         &uut1, &ctx1, NULL, NULL,
-        test_write_wrapper, test_read_wrapper, test_reset_fn,
-        test_msg_dispatch_fn, NULL
+        test_write_wrapper, test_read_wrapper, test_reset_fn, test_io_notify_config,
+        test_msg_dispatch_fn, test_crc_fn, test_crc_polyn_config
     );
     xpc_relay_config(
         &uut2, &ctx2, NULL, NULL,
-        test_write_wrapper, test_read_wrapper, test_reset_fn,
-        test_msg_dispatch_fn, NULL
+        test_write_wrapper, test_read_wrapper, test_reset_fn, test_io_notify_config,
+        test_msg_dispatch_fn, test_crc_fn, test_crc_polyn_config
     );
 
     ctx1.write_fd = fd_set1[1];
@@ -188,13 +214,13 @@ int test_dual_reset(void) {
 
     xpc_relay_config(
         &uut1, &ctx1, NULL, NULL,
-        test_write_wrapper, test_read_wrapper, test_reset_fn,
-        test_msg_dispatch_fn, NULL
+        test_write_wrapper, test_read_wrapper, test_reset_fn, test_io_notify_config,
+        test_msg_dispatch_fn, test_crc_fn, test_crc_polyn_config
     );
     xpc_relay_config(
         &uut2, &ctx2, NULL, NULL,
-        test_write_wrapper, test_read_wrapper, test_reset_fn,
-        test_msg_dispatch_fn, NULL
+        test_write_wrapper, test_read_wrapper, test_reset_fn, test_io_notify_config,
+        test_msg_dispatch_fn, test_crc_fn, test_crc_polyn_config
     );
 
     ctx1.write_fd = fd_set1[1];
@@ -250,21 +276,6 @@ done:
 }
 
 
-uint16_t crc_table[256];
-
-typedef struct {
-    crc_t crc;
-} crc_ctx_t;
-
-
-char *test_crc_fn(void *crc_ctx, char *buf, size_t bytes) {
-    crc_ctx_t *ctx = (crc_ctx_t*)crc_ctx;
-    ctx->crc = crc_init();
-    ctx->crc = crc_update(ctx->crc, buf, bytes);
-    ctx->crc = crc_finalize(ctx->crc);
-    return (char*)&ctx->crc;
-}
-
 int test_withcrc(void) {
     int fd_set1[2] = {0};
     int fd_set2[2] = {0};
@@ -287,13 +298,13 @@ int test_withcrc(void) {
 
     xpc_relay_config(
         &uut1, &ctx1, NULL, &crc1,
-        test_write_wrapper, test_read_wrapper, test_reset_fn,
-        test_msg_dispatch_fn, test_crc_fn
+        test_write_wrapper, test_read_wrapper, test_reset_fn, test_io_notify_config,
+        test_msg_dispatch_fn, test_crc_fn, test_crc_polyn_config
     );
     xpc_relay_config(
         &uut2, &ctx2, NULL, &crc2,
-        test_write_wrapper, test_read_wrapper, test_reset_fn,
-        test_msg_dispatch_fn, test_crc_fn
+        test_write_wrapper, test_read_wrapper, test_reset_fn, test_io_notify_config,
+        test_msg_dispatch_fn, test_crc_fn, test_crc_polyn_config
     );
 
     // force relays to use crc without requiring full config msg.
@@ -351,7 +362,94 @@ done:
     return r;
 }
 
+int test_config_msg(void) {
+    int fd_set1[2] = {0};
+    int fd_set2[2] = {0};
+    int r = pipe(fd_set1);
+    if(r == -1) {
+        goto done;
+    }
+    r = pipe(fd_set2);
+    if(r == -1) {
+        close(fd_set1[0]);
+        close(fd_set1[1]);
+        goto done;
+    }
+
+    test_io_ctx_t ctx1 = {0};
+    test_io_ctx_t ctx2 = {0};
+    xpc_relay_state_t uut1 = {0};
+    xpc_relay_state_t uut2 = {0};
+    crc_ctx_t crc1, crc2;
+
+    xpc_relay_config(
+        &uut1, &ctx1, NULL, &crc1,
+        test_write_wrapper, test_read_wrapper, test_reset_fn, test_io_notify_config,
+        test_msg_dispatch_fn, test_crc_fn, test_crc_polyn_config
+    );
+    xpc_relay_config(
+        &uut2, &ctx2, NULL, &crc2,
+        test_write_wrapper, test_read_wrapper, test_reset_fn, test_io_notify_config,
+        test_msg_dispatch_fn, test_crc_fn, test_crc_polyn_config
+    );
+
+    ctx1.write_fd = fd_set1[1];
+    ctx2.read_fd = fd_set1[0];
+
+    ctx2.write_fd = fd_set2[1];
+    ctx1.read_fd = fd_set2[0];
+
+    // send reset
+    xpc_relay_send_reset(&uut1);
+    printf("UUT1\n");
+    xpc_wr_op_continue(&uut1);
+
+    // receive reset and reply
+    printf("UUT2\n");
+    xpc_rd_op_continue(&uut2);
+    xpc_wr_op_continue(&uut2);
+
+    // receive reply
+    printf("UUT1\n");
+    xpc_rd_op_continue(&uut1);
+    printf("--->reset test complete\n");
+
+    // reset sequence complete, send a message!
+    printf("UUT1\n");
+    // an extra wr op is required, since we are in reset until rx sm gets reply
+    // and the next write operation occurs.
+    // (this will not happen in a non-test case)
+    xpc_wr_op_continue(&uut1);
+
+    // reconfigure to use CRCs
+    char crc_polyn[] = {'\x00', '\x08', '\x92', '\xd0'};
+    xpc_relay_send_config(&uut1, 32, crc_polyn, 1);
+    xpc_wr_op_continue(&uut1);
+
+    printf("UUT2\n");
+    xpc_rd_op_continue(&uut2);
+
+    printf("UUT1\n");
+    // send messages with crc
+    xpc_send_msg(&uut1, 1, 1, "hello uut2!\n", 12);
+    xpc_wr_op_continue(&uut1);
+    printf("UUT2\n");
+    xpc_rd_op_continue(&uut2);
+
+    xpc_send_msg(&uut2, 1, 1, "hello uut1!\n", 12);
+    xpc_wr_op_continue(&uut2);
+    printf("UUT1\n");
+    xpc_rd_op_continue(&uut1);
+
+    close(fd_set1[0]);
+    close(fd_set1[1]);
+    close(fd_set2[0]);
+    close(fd_set2[1]);
+done:
+    return r;
+}
+
 int main(void) {
-    test_withcrc();
+    test_config_msg();
     return 0;
 }
